@@ -5,32 +5,31 @@ from flask import Flask, request, send_file, render_template_string
 
 app = Flask(__name__)
 
+# Professional UI Design
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Annotator Pro - Final Fix</title>
+    <title>Annotator Pro</title>
     <style>
         body { font-family: sans-serif; background: #f8fafc; display: flex; justify-content: center; padding-top: 50px; }
         .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); width: 450px; text-align: center; }
-        .info { text-align: left; font-size: 13px; color: #475569; background: #f1f5f9; padding: 15px; border-radius: 8px; margin-bottom: 20px; }
-        button { background: #2563eb; color: white; border: none; padding: 12px; width: 100%; border-radius: 6px; cursor: pointer; font-weight: bold; }
-        .error { color: #dc2626; font-size: 14px; margin-top: 10px; }
+        .status-badge { display: inline-block; background: #dcfce7; color: #166534; padding: 4px 12px; border-radius: 99px; font-size: 12px; margin-bottom: 20px; }
+        button { background: #2563eb; color: white; border: none; padding: 12px; width: 100%; border-radius: 8px; cursor: pointer; font-weight: bold; margin-top: 10px; }
+        .info { text-align: left; font-size: 12px; color: #64748b; margin-top: 20px; border-top: 1px solid #e2e8f0; pt: 15px; }
     </style>
 </head>
 <body>
     <div class="card">
+        <div class="status-badge">● Service Live</div>
         <h2>Annotator Tool</h2>
-        <div class="info">
-            <strong>Requirements:</strong><br>
-            • Upload a CSV file.<br>
-            • Ensure one column has IDs (like "annotator_id" or "user_id").<br>
-            • Value columns should contain the labels/scores.
-        </div>
         <form action="/process" method="post" enctype="multipart/form-data">
-            <input type="file" name="file" accept=".csv" required>
+            <input type="file" name="file" accept=".csv" required style="margin-bottom: 20px;">
             <button type="submit">Process & Download Results</button>
         </form>
+        <div class="info">
+            <p><strong>Tip:</strong> Ensure your CSV has a column for IDs (like "soul ID" or "annotator_id").</p>
+        </div>
     </div>
 </body>
 </html>
@@ -40,77 +39,64 @@ HTML_TEMPLATE = '''
 def index():
     return render_template_string(HTML_TEMPLATE)
 
+# Health check route for Render to keep the port open
+@app.route('/healthz')
+def healthz():
+    return "OK", 200
+
 @app.route('/process', methods=['POST'])
 def process():
     file = request.files.get('file')
     if not file: return "No file uploaded", 400
 
     try:
-        # 1. Load data without skipping rows first to inspect headers
+        # Load data - automatically detecting headers
         df = pd.read_csv(file)
         
-        # 2. Find the ID column automatically
-        # We look for common names, otherwise default to the 3rd column
-        user_col = None
-        possible_id_names = ['id', 'user', 'annotator', 'soul', 'worker']
+        # Flexibly find the ID column
+        user_col = 'annotator_id'
+        possible_ids = ['id', 'user', 'soul', 'annotator', 'worker']
+        target_col = None
         
         for col in df.columns:
-            if any(name in str(col).lower() for name in possible_id_names):
-                user_col = col
+            if any(name in str(col).lower() for name in possible_ids):
+                target_col = col
                 break
         
-        if user_col is None:
-            user_col = df.columns[2] if len(df.columns) >= 3 else df.columns[0]
+        # If no name match, default to 3rd column (index 2)
+        if target_col is None:
+            target_col = df.columns[2] if len(df.columns) >= 3 else df.columns[0]
 
-        # 3. Clean the ID column (Crucial Fix for 'DataFrame' error)
-        # We ensure we select ONLY the series and drop any rows that are completely empty
-        df = df.dropna(subset=[user_col])
-        df['temp_id'] = df[user_col].astype(str).str.strip()
-        final_user_col = 'annotator_id'
-        df = df.rename(columns={'temp_id': final_user_col})
+        # Use .copy() and specific selection to fix 'DataFrame' object has no attribute 'str'
+        df[user_col] = df[target_col].astype(str).str.strip()
 
-        # 4. Identify value columns (ignore ID columns and Unnamed noise)
-        value_cols = [col for col in df.columns if 'Unnamed' not in str(col) 
-                      and str(col).lower() not in possible_id_names 
-                      and col != final_user_col]
+        # Identify values to count
+        value_cols = [col for col in df.columns if col not in [user_col, target_col] and 'Unnamed' not in str(col)]
 
-        # 5. Build Results
-        # Start with unique users
-        unique_users = df[final_user_col].unique()
-        result = pd.DataFrame({final_user_col: unique_users})
-
+        # Group and Count logic
+        result = pd.DataFrame({user_col: df[user_col].unique()})
         for col in value_cols:
-            # Convert values to numeric, turning text into NaN
             df[col] = pd.to_numeric(df[col], errors='coerce')
-            
-            # Pivot table: Count occurrences of each value for each user
-            counts = (
-                df.groupby(final_user_col)[col]
-                .value_counts()
-                .unstack(fill_value=0)
-            )
-            
-            # Rename columns to be descriptive: "Attribute_Score"
-            counts.columns = [f"{col}_{int(c) if isinstance(c, float) else c}" for c in counts.columns]
-            result = result.merge(counts, on=final_user_col, how='left')
+            counts = df.groupby(user_col)[col].value_counts().unstack(fill_value=0)
+            counts.columns = [f"{col}_{str(int(c)) if isinstance(c, float) else c}" for c in counts.columns]
+            result = result.merge(counts, on=user_col, how='left')
 
-        # 6. Final cleanup of result
         result = result.fillna(0)
-        # Convert all count columns to integers
         for c in result.columns:
-            if c != final_user_col:
+            if c != user_col:
                 result[c] = pd.to_numeric(result[c]).astype(int)
 
-        # 7. Return the file
         output = io.BytesIO()
         result.to_csv(output, index=False)
         output.seek(0)
         
-        return send_file(output, mimetype="text/csv", as_attachment=True, download_name="annotator_report.csv")
+        return send_file(output, mimetype="text/csv", as_attachment=True, download_name="processed_annotator_data.csv")
 
     except Exception as e:
-        return f"Processing Error: {str(e)}", 500
+        return f"Error: {str(e)}", 500
 
 if __name__ == '__main__':
+    # Force use of Render's port or default to 10000
     port = int(os.environ.get("PORT", 10000))
+    # Listen on all interfaces (0.0.0.0)
     app.run(host='0.0.0.0', port=port)
