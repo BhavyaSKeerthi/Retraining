@@ -5,33 +5,30 @@ from flask import Flask, request, send_file, render_template_string
 
 app = Flask(__name__)
 
+# Professional UI Design
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Annotator Error & Cohort Tracker</title>
+    <title>Annotator Pro</title>
     <style>
         body { font-family: sans-serif; background: #f8fafc; display: flex; justify-content: center; padding-top: 50px; }
-        .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); width: 500px; text-align: center; }
-        .feature-tag { display: inline-block; background: #fff7ed; color: #9a3412; padding: 4px 12px; border-radius: 99px; font-size: 11px; font-weight: bold; margin-bottom: 10px; border: 1px solid #ffedd5; }
-        button { background: #1e293b; color: white; border: none; padding: 12px; width: 100%; border-radius: 8px; cursor: pointer; font-weight: bold; margin-top: 15px; }
-        .info { text-align: left; font-size: 12px; color: #64748b; margin-top: 20px; border-top: 1px solid #e2e8f0; padding-top: 15px; }
+        .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); width: 450px; text-align: center; }
+        .status-badge { display: inline-block; background: #dcfce7; color: #166534; padding: 4px 12px; border-radius: 99px; font-size: 12px; margin-bottom: 20px; }
+        button { background: #2563eb; color: white; border: none; padding: 12px; width: 100%; border-radius: 8px; cursor: pointer; font-weight: bold; margin-top: 10px; }
+        .info { text-align: left; font-size: 12px; color: #64748b; margin-top: 20px; border-top: 1px solid #e2e8f0; pt: 15px; }
     </style>
 </head>
 <body>
     <div class="card">
-        <div class="feature-tag">ERROR SUMMATION LOGIC ENABLED</div>
-        <h2>Retraining Dashboard</h2>
-        <p>Upload CSV to identify error counts and cohort groups.</p>
+        <div class="status-badge">● Service Live</div>
+        <h2>Annotator Tool</h2>
         <form action="/process" method="post" enctype="multipart/form-data">
-            <input type="file" name="file" accept=".csv" required>
-            <button type="submit">Analyze Mistakes</button>
+            <input type="file" name="file" accept=".csv" required style="margin-bottom: 20px;">
+            <button type="submit">Process & Download Results</button>
         </form>
         <div class="info">
-            <strong>Analysis Logic:</strong><br>
-            • Ignores Rubric 2 (Correct).<br>
-            • Calculates <b>Total_Mistakes</b> (Sum of Rubric 0 + Rubric 1).<br>
-            • Assigns Cohorts based on the highest mistake category.
+            <p><strong>Tip:</strong> Ensure your CSV has a column for IDs (like "soul ID" or "annotator_id").</p>
         </div>
     </div>
 </body>
@@ -42,73 +39,64 @@ HTML_TEMPLATE = '''
 def index():
     return render_template_string(HTML_TEMPLATE)
 
+# Health check route for Render to keep the port open
+@app.route('/healthz')
+def healthz():
+    return "OK", 200
+
 @app.route('/process', methods=['POST'])
 def process():
     file = request.files.get('file')
     if not file: return "No file uploaded", 400
 
     try:
+        # Load data - automatically detecting headers
         df = pd.read_csv(file)
         
-        # 1. Identify Annotator ID
+        # Flexibly find the ID column
         user_col = 'annotator_id'
-        possible_ids = ['id', 'user', 'soul', 'annotator']
-        target_col = next((c for c in df.columns if any(p in str(c).lower() for p in possible_ids)), df.columns[2])
+        possible_ids = ['id', 'user', 'soul', 'annotator', 'worker']
+        target_col = None
         
+        for col in df.columns:
+            if any(name in str(col).lower() for name in possible_ids):
+                target_col = col
+                break
+        
+        # If no name match, default to 3rd column (index 2)
+        if target_col is None:
+            target_col = df.columns[2] if len(df.columns) >= 3 else df.columns[0]
+
+        # Use .copy() and specific selection to fix 'DataFrame' object has no attribute 'str'
         df[user_col] = df[target_col].astype(str).str.strip()
-        
-        # Identify original rubric/attribute columns
-        attr_cols = [c for c in df.columns if c not in [user_col, target_col] and 'Unnamed' not in str(c)]
 
-        # 2. Process User-Level Error Sums
-        unique_users = df[user_col].unique()
-        result = pd.DataFrame({user_col: unique_users})
+        # Identify values to count
+        value_cols = [col for col in df.columns if col not in [user_col, target_col] and 'Unnamed' not in str(col)]
 
-        for col in attr_cols:
+        # Group and Count logic
+        result = pd.DataFrame({user_col: df[user_col].unique()})
+        for col in value_cols:
             df[col] = pd.to_numeric(df[col], errors='coerce')
-            
-            # Count occurrences per user
             counts = df.groupby(user_col)[col].value_counts().unstack(fill_value=0)
-            
-            # Filter for Rubric 0 and Rubric 1 specifically
-            r0 = counts[0] if 0 in counts.columns else 0
-            r1 = counts[1] if 1 in counts.columns else 0
-            
-            # Create the Summation Column: Mistakes_In_Attribute
-            result[f"{col}_total_mistakes"] = (r0 + r1).values if hasattr((r0 + r1), 'values') else (r0 + r1)
+            counts.columns = [f"{col}_{str(int(c)) if isinstance(c, float) else c}" for c in counts.columns]
+            result = result.merge(counts, on=user_col, how='left')
 
-        # 3. Global Mistake Count
-        mistake_cols = [c for c in result.columns if c.endswith('_total_mistakes')]
-        result['overall_total_errors'] = result[mistake_cols].sum(axis=1)
-
-        # 4. Cohort Assignment Logic
-        def assign_cohort(row):
-            if row['overall_total_errors'] == 0:
-                return "Cohort: Proficient"
-            
-            # Find the attribute with the most errors
-            max_error_col = row[mistake_cols].idxmax()
-            clean_name = max_error_col.replace('_total_mistakes', '').replace('_', ' ').title()
-            return f"Cohort: {clean_name} Retraining"
-
-        result['cohort_group'] = result.apply(assign_cohort, axis=1)
-
-        # Final Formatting
+        result = result.fillna(0)
         for c in result.columns:
-            if c not in [user_col, 'cohort_group']:
-                result[c] = result[c].astype(int)
+            if c != user_col:
+                result[c] = pd.to_numeric(result[c]).astype(int)
 
-        # 5. Export
         output = io.BytesIO()
         result.to_csv(output, index=False)
         output.seek(0)
         
-        return send_file(output, mimetype="text/csv", as_attachment=True, download_name="retraining_cohorts.csv")
+        return send_file(output, mimetype="text/csv", as_attachment=True, download_name="processed_annotator_data.csv")
 
     except Exception as e:
-        import traceback
-        return f"Error: {str(e)}<br><pre>{traceback.format_exc()}</pre>", 500
+        return f"Error: {str(e)}", 500
 
 if __name__ == '__main__':
+    # Force use of Render's port or default to 10000
     port = int(os.environ.get("PORT", 10000))
+    # Listen on all interfaces (0.0.0.0)
     app.run(host='0.0.0.0', port=port)
